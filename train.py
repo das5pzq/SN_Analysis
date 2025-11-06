@@ -7,6 +7,12 @@ from torch.utils.data import TensorDataset, DataLoader, random_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils import shuffle
 import matplotlib.pyplot as plt
+import optuna
+from optuna.samplers import TPESampler
+from optuna.trial import TrialState
+from optuna.pruners import HyperbandPruner
+from optuna.logging import get_logger
+from optuna.visualization import plot_optimization_history, plot_param_importances
 
 sig_path = "data/compact_mc_jpsi_target_pythia8_acc.npy"
 bkg_path = "data/comb_target_raw_oct24_acc.npy"
@@ -24,10 +30,12 @@ MAX_EVENTS_PER_CLASS = 1_000_000   # cap per class (applied after loading)
 BALANCE_CLASSES = True            
 BATCH_SIZE = 64
 LR = 1e-3                         
-NUM_EPOCHS = 200
+NUM_EPOCHS = 50
 PATIENCE = 50
 NORMALIZE = True                    
 SEED = 42
+L1_REG = 1e-5  # L1 regularization coefficient
+L2_REG = 1e-4  # L2 regularization coefficient (in addition to weight_decay)
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -133,47 +141,224 @@ def get_adjusted_test_loader(batch_size=64):
 
 test_loader = get_adjusted_test_loader(batch_size=BATCH_SIZE)
 
-# =========================================================
-# IMPROVED Model: ReLU + BatchNorm + Deeper
-# =========================================================
-class ParticleClassifier(nn.Module):
-    def __init__(self, input_dim=N_FEATS, hidden_dims=(512, 256, 128), dropout=0.3):
+class ResidualConnection(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
         super().__init__()
-        h1, h2, h3 = hidden_dims
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, h1),
-            nn.ReLU(),
-            nn.BatchNorm1d(h1),
-            nn.Dropout(dropout),
-            
-            nn.Linear(h1, h2),
-            nn.ReLU(),
-            nn.BatchNorm1d(h2),
-            nn.Dropout(dropout),
-            
-            nn.Linear(h2, h3),
-            nn.ReLU(),
-            nn.BatchNorm1d(h3),
-            nn.Dropout(dropout),
-            
-            nn.Linear(h3, 1)  # logits; will use BCEWithLogitsLoss
-        )
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.relu = nn.ReLU()
+        self.bn1 = nn.BatchNorm1d(hidden_dim)  
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        
+        if input_dim != hidden_dim:
+            self.proj = nn.Linear(input_dim, hidden_dim)
+        else:
+            self.proj = None
 
     def forward(self, x):
-        return self.net(x)
+        residual = x
+        if self.proj is not None:
+            residual = self.proj(x)
+        
+        out = self.relu(self.bn1(self.fc1(x)))
+        out = self.fc2(out)
+        out = self.relu(self.bn2(out) + residual)
+        return out
+
+
+
+class ParticleClassifier(nn.Module):
+    def __init__(self, input_dim=N_FEATS, hidden_dims=(512, 256, 128), dropout=0.3, n_layers=None):
+        super().__init__()
+        if n_layers is None:
+            n_layers = len(hidden_dims)
+        
+        self.layers = nn.ModuleList()
+        for i in range(n_layers):
+            self.layers.append(ResidualConnection(input_dim if i == 0 else hidden_dims[i-1], hidden_dims[i]))
+        
+        self.output = nn.Linear(hidden_dims[-1], 1)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return self.output(x)
 
 def count_parameters(model):
     total = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total
 
-model = ParticleClassifier(input_dim=N_FEATS, hidden_dims=(512, 256, 128), dropout=0.3).to(device)
+def compute_regularization_loss(model, l1_reg=0.0, l2_reg=0.0):
+
+    l1_loss = 0.0
+    l2_loss = 0.0
+    
+    for param in model.parameters():
+        if param.requires_grad:
+            if l1_reg > 0.0:
+                l1_loss += torch.sum(torch.abs(param))
+            if l2_reg > 0.0:
+                l2_loss += torch.sum(param ** 2)
+    
+    return l1_reg * l1_loss + l2_reg * l2_loss
+
+def batch_acc_from_logits(logits, targets, thresh=0.5):
+    probs = torch.sigmoid(logits)
+    preds = (probs > thresh).float()
+    return (preds == targets).float().mean().item()
+
+def objective(trial):
+
+    n_layers = trial.suggest_int("n_layers", 2, 8)
+    hidden_dims = tuple(trial.suggest_int(f"hidden_{i}", 8, 1024, step=64) for i in range(n_layers))
+    
+    params = {
+        'n_layers': n_layers,
+        'hidden_dims': hidden_dims,
+        'lr': trial.suggest_float("lr", 1e-4, 1e-2, log=True),
+        'weight_decay': trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True),
+        'batch_size': trial.suggest_categorical("batch_size", [32, 64, 128, 256]),
+        'l1_reg': trial.suggest_float("l1_reg", 0.0, 0.1),
+        'l2_reg': trial.suggest_float("l2_reg", 0.0, 0.1),
+        'beta1': trial.suggest_float("beta1", 0.8, 0.95),
+        'beta2': trial.suggest_float("beta2", 0.95, 0.999),
+        'epsilon': trial.suggest_float("epsilon", 1e-9, 1e-6, log=True),
+        'patience': trial.suggest_int("patience", 5, 20),
+    }
+    
+    print(f"Training with params: {params}")
+
+    model = ParticleClassifier(input_dim=N_FEATS, hidden_dims=params['hidden_dims'], n_layers=params['n_layers']).to(device)
+
+    criterion = nn.BCEWithLogitsLoss()
+
+    optimizer = optim.AdamW(model.parameters(), 
+                            lr=params['lr'], 
+                            weight_decay=params['weight_decay'],
+                            betas=(params['beta1'], params['beta2']),
+                            eps=params['epsilon'])
+
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=params['patience'], verbose=False
+    )
+    
+    train_loader_trial = DataLoader(train_ds, batch_size=params['batch_size'], shuffle=True)
+    val_loader_trial = DataLoader(val_ds, batch_size=params['batch_size'], shuffle=False)
+    
+
+    train_losses, val_losses = [], []
+    train_accs, val_accs = [], []
+
+    for epoch in range(1, 101):
+        model.train()
+        epoch_loss, epoch_acc, batches = 0.0, 0.0, 0
+        for xb, yb in train_loader_trial:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            reg_loss = compute_regularization_loss(model, params['l1_reg'], params['l2_reg'])
+            loss = loss + reg_loss
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            epoch_acc  += batch_acc_from_logits(logits, yb)
+            batches    += 1
+
+        train_loss = epoch_loss / batches
+        train_acc  = 100.0 * (epoch_acc / batches)
+        train_losses.append(train_loss)
+        train_accs.append(train_acc)
+
+        model.eval()
+        val_loss_accum, val_acc_accum, v_batches = 0.0, 0.0, 0
+        with torch.no_grad():
+            for xb, yb in val_loader_trial:
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+                logits = model(xb)
+                loss = criterion(logits, yb)
+                val_loss_accum += loss.item()
+                val_acc_accum  += batch_acc_from_logits(logits, yb)
+                v_batches += 1
+
+        val_loss = val_loss_accum / v_batches
+        val_acc  = 100.0 * (val_acc_accum / v_batches)
+        val_losses.append(val_loss)
+        val_accs.append(val_acc)
+
+        scheduler.step(val_loss)
+
+        trial.report(val_loss, epoch)
+        
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+        
+        print(f"Epoch [{epoch:3d}/100] | "
+              f"Train Loss={train_loss:.4f} Acc={train_acc:.2f}% | "
+              f"Val Loss={val_loss:.4f} Acc={val_acc:.2f}%")
+
+    return val_losses[-1]
+
+study = optuna.create_study(
+    study_name="dimuon_classifier",
+    direction="minimize",
+    sampler=TPESampler(seed=SEED),
+    pruner=HyperbandPruner(
+        min_resource=1,
+        max_resource=100,
+        reduction_factor=3,
+        min_early_stopping_rate=0
+    ),
+    storage="sqlite:///dimuon_classifier.db",
+    load_if_exists=True
+)
+
+# Run the optimization
+print("\n" + "="*60)
+print("Starting Optuna Hyperparameter Optimization")
+print("="*60)
+study.optimize(objective, n_trials=50, timeout=None)
+
+print("\n" + "="*60)
+print("Optimization finished!")
+print("="*60)
+print(f"Number of finished trials: {len(study.trials)}")
+print(f"Number of pruned trials: {len([t for t in study.trials if t.state == TrialState.PRUNED])}")
+print(f"Number of complete trials: {len([t for t in study.trials if t.state == TrialState.COMPLETE])}")
+
+print("\nBest trial:")
+trial = study.best_trial
+print(f"  Value: {trial.value:.4f}")
+print(f"  Params:")
+for key, value in trial.params.items():
+    print(f"    {key}: {value}")
+
+# Get best model parameters
+best_params = study.best_params
+print(f"\nBest parameters: {best_params}")
+
+# Reconstruct hidden_dims tuple from individual parameters
+best_n_layers = best_params.get('n_layers', 3)
+best_hidden_dims = tuple(best_params.get(f'hidden_{i}', 128) for i in range(best_n_layers))
+if not best_hidden_dims:
+    best_hidden_dims = (512, 256, 128)
+    best_n_layers = 3
+
+model = ParticleClassifier(input_dim=N_FEATS, hidden_dims=best_hidden_dims, n_layers=best_n_layers).to(device)
+
 print(f"🧮 Trainable parameters: {count_parameters(model):,}")
 
-# Loss function
 criterion = nn.BCEWithLogitsLoss()
 
-# IMPROVED: AdamW optimizer with weight decay
-optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+optimizer = optim.AdamW(model.parameters(), 
+                        lr=best_params['lr'], 
+                        weight_decay=best_params['weight_decay'],
+                        betas=(best_params['beta1'], best_params['beta2']),
+                        eps=best_params['epsilon'])
 
 # NEW: Learning rate scheduler
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -208,6 +393,9 @@ for epoch in range(1, NUM_EPOCHS + 1):
         optimizer.zero_grad()
         logits = model(xb)
         loss = criterion(logits, yb)
+        # Add L1 and L2 regularization
+        reg_loss = compute_regularization_loss(model, L1_REG, L2_REG)
+        loss = loss + reg_loss
         loss.backward()
         optimizer.step()
 
